@@ -820,6 +820,11 @@ fn apply_in(c: &Connection, store: &Path) -> Result<ApplyReceipt, ChangeError> {
             "the bundle carries pack content for a Store that keeps none",
         ));
     }
+    // Pause logging for the installed rows: every trigger fires only while
+    // `change_state` has its row. Logging them and deleting the log afterwards
+    // would leave the replica with free pages as large as the log (about
+    // 0.6 MB per 14k objects), which every whole-metadata upload repeats.
+    c.execute("DELETE FROM main.change_state", [])?;
     let order = LOGGED
         .iter()
         .filter(|t| t.code != TOTALS)
@@ -869,14 +874,14 @@ fn apply_in(c: &Connection, store: &Path) -> Result<ApplyReceipt, ChangeError> {
             [],
         )?;
     }
-    // The installed rows logged themselves; the replica now stands at `after`.
+    // Resume logging; the replica now stands at `after`.
     c.execute("DELETE FROM main.change_log", [])?;
     c.execute(
         "INSERT INTO main.change_log(seq,tbl) VALUES(?1,0)",
         [after.seq as i64],
     )?;
     c.execute(
-        "UPDATE main.change_state SET state=?1,seq=?2 WHERE id=1",
+        "INSERT INTO main.change_state(id,state,seq) VALUES(1,?1,?2)",
         params![&after.state[..], after.seq as i64],
     )?;
     Ok(ApplyReceipt {
