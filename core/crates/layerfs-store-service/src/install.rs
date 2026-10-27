@@ -181,6 +181,21 @@ pub fn install_local(
         }
         file.flush().map_err(text)?;
         drop(file);
+        // ExternalContent: the content file is in place before the Store file's
+        // rename publishes it; the open below checks it covers every pack.
+        let content = layerfs_persistence::content_path(source);
+        if content.exists() {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut from = File::open(&content).map_err(text)?;
+            let mut to = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(layerfs_persistence::content_path(&target))
+                .map_err(text)?;
+            io::copy(&mut from, &mut to).map_err(text)?;
+            to.flush().map_err(text)?;
+        }
         fs::rename(&temporary, &target).map_err(text)?;
         left.published = true;
         left.temporary = Some(target.clone());

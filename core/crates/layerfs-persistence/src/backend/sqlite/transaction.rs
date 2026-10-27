@@ -25,6 +25,14 @@ impl Transaction<'_> {
     pub(crate) fn reclamation_enabled(&self) -> bool {
         self.owner.profile.auto_vacuum == 2
     }
+    /// The `ExternalContent` content file; any other layout has none.
+    pub(crate) fn content(&self) -> Result<&std::fs::File, BackendError> {
+        self.owner.content.as_ref().ok_or(BackendError::Integrity)
+    }
+    /// Whether this Session promises kernel-crash durability.
+    pub(crate) fn durable(&self) -> bool {
+        self.owner.profile.persistence == crate::SqlitePersistenceProfile::Durable
+    }
     pub(crate) fn input_limit(
         &self,
         bindings: usize,

@@ -144,6 +144,8 @@ pub(crate) struct Session {
     pub(crate) layout: crate::SqlitePackLayout,
     pub(crate) acquisition: crate::SqliteAcquisitionSchema,
     pub(crate) path: PathBuf,
+    /// Append-only pack content file; present exactly for `ExternalContent`.
+    pub(crate) content: Option<std::fs::File>,
 }
 impl Session {
     pub(crate) fn connect(
@@ -183,16 +185,36 @@ impl Session {
             // Versions 1 to 6 kept inode values in pooled packs behind an
             // ordinal catalogue. Such a Store is refused here, never misread.
             let acquisition = match stored {
-                16..=18 => crate::SqliteAcquisitionSchema::Absent,
-                22..=24 => crate::SqliteAcquisitionSchema::Tables,
+                16..=19 => crate::SqliteAcquisitionSchema::Absent,
+                22..=25 => crate::SqliteAcquisitionSchema::Tables,
                 _ => return Err(BackendError::Integrity),
             };
             let layout = match stored - acquisition.version_offset() {
                 16 => crate::SqlitePackLayout::Monolithic,
                 17 => crate::SqlitePackLayout::GroupRows,
-                _ => crate::SqlitePackLayout::GroupRowsIndexed,
+                18 => crate::SqlitePackLayout::GroupRowsIndexed,
+                _ => crate::SqlitePackLayout::ExternalContent,
             };
             (layout, acquisition)
+        };
+        let content = if layout.uses_external_content() {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(writable)
+                .create(create)
+                .open(crate::config::content_path(path))
+                .map_err(|_| BackendError::Integrity)?;
+            if !create {
+                // I2: every committed pack lies inside the file.
+                let end = super::content::committed_end(&connection, &work)?;
+                let length = file.metadata().map_err(|_| BackendError::Integrity)?.len();
+                if length < end {
+                    return Err(BackendError::Integrity);
+                }
+            }
+            Some(file)
+        } else {
+            None
         };
         let integer = |name| {
             query::run(&connection, &format!("PRAGMA {name}"), vec![], &work)?
@@ -258,6 +280,7 @@ impl Session {
             profile,
             layout,
             acquisition,
+            content,
         })
     }
     /// Stored schema version: the pack layout's, offset by the acquisition tables.

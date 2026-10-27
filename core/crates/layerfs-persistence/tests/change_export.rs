@@ -12,7 +12,9 @@ use layerfs_history::{BranchId, HistoryCatalog, HistoryCatalogConfig};
 use layerfs_persistence::replication::{
     apply_changes, export_changes, mark_base, read_state, ChangeError,
 };
-use layerfs_persistence::{Handles, PersistenceConfig, SqlitePersistenceProfile};
+use layerfs_persistence::{
+    content_path, Handles, PersistenceConfig, SqlitePackLayout, SqlitePersistenceProfile,
+};
 use layerfs_storage::{Storage, StoragePolicy};
 use layerfs_telemetry::timer::Timing;
 use support::*;
@@ -359,4 +361,109 @@ fn an_unmarked_store_logs_nothing_and_exports_nothing() {
         export_changes(&live, cursor, &t.join("bundle")),
         Err(ChangeError::NotBase)
     ));
+}
+
+#[test]
+fn an_external_content_replica_gains_each_bundled_body_at_its_end() {
+    let t = Temp::new("change-external");
+    let live = t.join("live");
+    let handles = Handles::create(
+        config(&live).with_sqlite_pack_layout(SqlitePackLayout::ExternalContent),
+        StoragePolicy::frozen_default(),
+        &HistoryCatalogConfig {
+            cursor_key: [71; 32],
+            binding_key: BINDING.to_vec(),
+            incarnation: 7,
+        },
+    )
+    .unwrap();
+    handles
+        .history
+        .initialize_layerstack(&StackInitialization {
+            logical: 0,
+            stack: stack(1),
+            name: name("main"),
+            scope: root(200),
+            profile: root(201),
+            genesis_root: root(0),
+        })
+        .unwrap();
+    save(
+        &Storage::new(handles.storage.clone()).unwrap(),
+        b"genesis bytes",
+    );
+    drop(handles);
+    let base = mark_base(&live, [8; 32]).unwrap();
+    let replica = t.join("replica");
+    std::fs::copy(&live, &replica).unwrap();
+    std::fs::copy(content_path(&live), content_path(&replica)).unwrap();
+    let base_content = std::fs::metadata(content_path(&replica)).unwrap().len();
+
+    let handles = writable(&live);
+    let storage = Storage::new(handles.storage.clone()).unwrap();
+    let history: &dyn HistoryCatalog = &handles.history;
+    let genesis = history.layer_stack(stack(1)).unwrap().unwrap().head_layer;
+    history
+        .fork(&ForkRequest {
+            stack: stack(1),
+            branch: branch_id(1),
+            name: name("b1"),
+            source: ForkSource::Layer(genesis),
+        })
+        .unwrap();
+    commit(history, branch_id(1), 1);
+    let large = save(&storage, &vec![7u8; 400_000]);
+    let first = t.join("bundle-1");
+    let one = export_changes(&live, base, &first).unwrap();
+    let more = save(&storage, &vec![9u8; 300_000]);
+    commit(history, branch_id(1), 2);
+    let second = t.join("bundle-2");
+    let two = export_changes(&live, one.after, &second).unwrap();
+    drop(storage);
+    drop(handles);
+
+    // A changed body is refused before any byte reaches the replica.
+    let tampered = t.join("tampered");
+    std::fs::copy(&first, &tampered).unwrap();
+    rusqlite::Connection::open(&tampered)
+        .unwrap()
+        .execute(
+            "UPDATE bundle_content SET body=zeroblob(length(body)) \
+             WHERE pack_id=(SELECT max(pack_id) FROM bundle_content)",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        apply_changes(&replica, &tampered),
+        Err(ChangeError::Integrity(_))
+    ));
+    assert_eq!(
+        std::fs::metadata(content_path(&replica)).unwrap().len(),
+        base_content
+    );
+
+    assert_eq!(apply_changes(&replica, &first).unwrap().after, one.after);
+    assert_eq!(apply_changes(&replica, &second).unwrap().after, two.after);
+    assert_eq!(rows(&replica), rows(&live));
+    assert_eq!(
+        std::fs::read(content_path(&replica)).unwrap(),
+        std::fs::read(content_path(&live)).unwrap()
+    );
+    let opened = writable(&replica);
+    let source = writable(&live);
+    let read = |h: &Handles| {
+        let storage = Storage::new(h.storage.clone()).unwrap();
+        let reader = storage.reader().unwrap();
+        (
+            reader.file_lengths(&[large, more]).unwrap(),
+            reader.read_objects(&[large, more]).unwrap(),
+        )
+    };
+    let (lengths, objects) = read(&opened);
+    assert_eq!(lengths, [400_000, 300_000]);
+    assert_eq!((lengths, objects), read(&source));
+    assert_eq!(
+        opened.history.branch(branch_id(1)).unwrap(),
+        source.history.branch(branch_id(1)).unwrap()
+    );
 }

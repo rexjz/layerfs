@@ -20,7 +20,7 @@
 //! state never share a later state, and a bundle applies only to the state it
 //! was exported from.
 use rusqlite::{params, types::ValueRef, Connection, OpenFlags, OptionalExtension};
-use std::{fmt, fs, io, path::Path};
+use std::{fmt, fs, io, os::unix::fs::FileExt, path::Path};
 
 /// Bundle format written and read by this module.
 pub const BUNDLE_FORMAT: i64 = 1;
@@ -267,6 +267,21 @@ CREATE TABLE bundle_delete (
 ) STRICT;
 ";
 
+/// Whether `schema`'s `pack` table keeps its bodies in the content file.
+fn external(c: &Connection, schema: &str) -> Result<bool, ChangeError> {
+    Ok(c.query_row(
+        "SELECT count(*) FROM pragma_table_info('pack',?1) WHERE name='content_offset'",
+        [schema],
+        |r| r.get::<_, i64>(0),
+    )? == 1)
+}
+
+/// The bodies of a bundle's packs, for an `ExternalContent` Store.
+const BUNDLE_CONTENT: &str = "CREATE TABLE bundle_content (
+ pack_id INTEGER PRIMARY KEY,
+ body BLOB NOT NULL
+) STRICT;";
+
 fn quoted(name: &str) -> String {
     format!("\"{name}\"")
 }
@@ -420,6 +435,17 @@ fn bundle_digest(c: &Connection, schema: &str) -> Result<([u8; 32], u64, u64), C
             deletes += 1;
         }
     }
+    if table_exists(c, schema, "bundle_content")? {
+        h.update(b"c");
+        let mut stmt = c.prepare(&format!(
+            "SELECT pack_id,body FROM {schema}.bundle_content ORDER BY pack_id"
+        ))?;
+        let mut cursor = stmt.query([])?;
+        while let Some(row) = cursor.next()? {
+            feed(&mut h, row.get_ref(0)?);
+            feed(&mut h, row.get_ref(1)?);
+        }
+    }
     Ok((h.finalize().into(), rows, deletes))
 }
 
@@ -483,7 +509,7 @@ pub fn export_changes(
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     source.execute_batch("BEGIN")?;
-    let exported = export_in(&source, since, bundle);
+    let exported = export_in(&source, store, since, bundle);
     // Ends the read snapshot; a read transaction has nothing to commit.
     let _ = source.execute_batch("COMMIT");
     exported
@@ -491,6 +517,7 @@ pub fn export_changes(
 
 fn export_in(
     source: &Connection,
+    store: &Path,
     since: ChangeCursor,
     bundle: &Path,
 ) -> Result<ExportReceipt, ChangeError> {
@@ -532,7 +559,12 @@ fn export_in(
         }
         Err(error) => return Err(error.into()),
     }
-    let written = write_bundle(source, since, last, &catalog, bundle);
+    let content = if external(source, "main")? {
+        Some(fs::File::open(crate::config::content_path(store))?)
+    } else {
+        None
+    };
+    let written = write_bundle(source, since, last, &catalog, bundle, content.as_ref());
     match written {
         Ok((after, digest, rows, deletes)) => Ok(ExportReceipt {
             before: since,
@@ -556,6 +588,7 @@ fn write_bundle(
     last: u64,
     catalog: &[u8],
     bundle: &Path,
+    content: Option<&fs::File>,
 ) -> Result<(ChangeCursor, [u8; 32], u64, u64), ChangeError> {
     let out = Connection::open(bundle)?;
     // The bundle holds copies of some rows; the replica checks references
@@ -634,6 +667,23 @@ fn write_bundle(
             }
         }
     }
+    // ExternalContent: each bundled pack carries its body, read from the
+    // content file; a committed pack's bytes never change once written.
+    if let Some(file) = content {
+        if table_exists(&out, "main", "pack")? {
+            out.execute_batch(BUNDLE_CONTENT)?;
+            let mut packs = out.prepare("SELECT pack_id,content_offset,length FROM pack")?;
+            let mut insert =
+                out.prepare("INSERT INTO bundle_content(pack_id,body) VALUES(?1,?2)")?;
+            let mut cursor = packs.query([])?;
+            while let Some(row) = cursor.next()? {
+                let (id, offset, length): (i64, i64, i64) = (row.get(0)?, row.get(1)?, row.get(2)?);
+                let mut body = vec![0; length as usize];
+                file.read_exact_at(&mut body, offset as u64)?;
+                insert.execute(params![id, body])?;
+            }
+        }
+    }
     let (digest, rows, deletes) = bundle_digest(&out, "main")?;
     let after = ChangeCursor {
         state: next_state(catalog, &since, last, &digest),
@@ -674,7 +724,7 @@ pub fn apply_changes(store: &Path, bundle: &Path) -> Result<ApplyReceipt, Change
         .ok_or(ChangeError::Integrity("the bundle path is not UTF-8"))?;
     c.execute("ATTACH DATABASE ?1 AS b", [name])?;
     c.execute_batch("BEGIN IMMEDIATE; PRAGMA defer_foreign_keys=ON;")?;
-    let applied = apply_in(&c);
+    let applied = apply_in(&c, store);
     let finished = finish(&c, applied);
     let _ = c.execute_batch("DETACH DATABASE b");
     finished
@@ -693,7 +743,7 @@ struct BundleMeta {
     digest: Vec<u8>,
 }
 
-fn apply_in(c: &Connection) -> Result<ApplyReceipt, ChangeError> {
+fn apply_in(c: &Connection, store: &Path) -> Result<ApplyReceipt, ChangeError> {
     let BundleMeta {
         format,
         catalog,
@@ -762,6 +812,14 @@ fn apply_in(c: &Connection) -> Result<ApplyReceipt, ChangeError> {
     if next_state(&catalog, &before, after.seq, &computed) != after.state {
         return Err(ChangeError::Integrity("bundle ending state"));
     }
+    let external = external(c, "main")?;
+    if external {
+        append_content(c, store)?;
+    } else if table_exists(c, "b", "bundle_content")? {
+        return Err(ChangeError::Integrity(
+            "the bundle carries pack content for a Store that keeps none",
+        ));
+    }
     let order = LOGGED
         .iter()
         .filter(|t| t.code != TOTALS)
@@ -800,8 +858,14 @@ fn apply_in(c: &Connection) -> Result<ApplyReceipt, ChangeError> {
                 [t.code],
             )?;
         }
+        // Content offsets must arrive in file order for `pack_content_append`.
+        let order = if external && t.table == "pack" {
+            " ORDER BY content_offset"
+        } else {
+            ""
+        };
         c.execute(
-            &format!("INSERT INTO main.{table} SELECT * FROM b.{table}"),
+            &format!("INSERT INTO main.{table} SELECT * FROM b.{table}{order}"),
             [],
         )?;
     }
@@ -821,6 +885,66 @@ fn apply_in(c: &Connection) -> Result<ApplyReceipt, ChangeError> {
         rows: rows as u64,
         deletes: deletes as u64,
     })
+}
+
+/// Writes every bundled pack body to the replica's content file, in offset
+/// order from the replica's committed end, then syncs; the rows that name
+/// them commit afterwards in the same apply. Bytes past the end belong to no
+/// row, so a failed apply leaves only an unreferenced tail.
+fn append_content(c: &Connection, store: &Path) -> Result<(), ChangeError> {
+    if !table_exists(c, "b", "pack")? {
+        if table_exists(c, "b", "bundle_content")? {
+            return Err(ChangeError::Integrity("bundle content without packs"));
+        }
+        return Ok(());
+    }
+    if !table_exists(c, "b", "bundle_content")? {
+        return Err(ChangeError::Integrity("bundled packs without content"));
+    }
+    let unmatched: i64 = c.query_row(
+        "SELECT (SELECT count(*) FROM b.bundle_content WHERE pack_id NOT IN (SELECT pack_id FROM b.pack)) \
+         + (SELECT count(*) FROM b.pack WHERE pack_id NOT IN (SELECT pack_id FROM b.bundle_content))",
+        [],
+        |r| r.get(0),
+    )?;
+    if unmatched != 0 {
+        return Err(ChangeError::Integrity(
+            "bundle content does not match its packs",
+        ));
+    }
+    let mut end: i64 = c.query_row(
+        "SELECT coalesce(max(content_offset+length),0) FROM main.pack",
+        [],
+        |r| r.get(0),
+    )?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(crate::config::content_path(store))?;
+    if (file.metadata()?.len() as i64) < end {
+        return Err(ChangeError::Integrity("the replica content file is short"));
+    }
+    let mut packs = c.prepare(
+        "SELECT p.content_offset,p.length,c.body FROM b.pack p JOIN b.bundle_content c USING(pack_id) \
+         ORDER BY p.content_offset",
+    )?;
+    let mut cursor = packs.query([])?;
+    while let Some(row) = cursor.next()? {
+        let (offset, length): (i64, i64) = (row.get(0)?, row.get(1)?);
+        let body = row
+            .get_ref(2)?
+            .as_blob()
+            .map_err(|_| ChangeError::Integrity("bundle content is not a BLOB"))?;
+        if offset != end || body.len() as i64 != length {
+            return Err(ChangeError::Integrity(
+                "bundle content does not continue the replica's content",
+            ));
+        }
+        file.write_all_at(body, offset as u64)?;
+        end += length;
+    }
+    file.sync_data()?;
+    Ok(())
 }
 
 /// Commits `outcome`'s transaction or rolls it back, then checkpoints so the

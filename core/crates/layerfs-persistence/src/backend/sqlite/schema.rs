@@ -19,6 +19,8 @@ pub(crate) const CHANGES: &str = include_str!("../../../sql/sqlite/change_log.sq
 pub(crate) const CHANGE_UNITS: &str = include_str!("../../../sql/sqlite/change_log_units.sql");
 const UNIT_INDEX: &str = include_str!("../../../sql/sqlite/objects_units_index.sql");
 const UNITS: &str = include_str!("../../../sql/sqlite/objects_units.sql");
+/// `ExternalContent`: pack metadata rows; bodies live in `<store>-content`.
+const EXTERNAL: &str = include_str!("../../../sql/sqlite/objects_external.sql");
 const ACQUISITION: &str = include_str!("../../../sql/sqlite/acquisition/schema.sql");
 type Selection = (crate::SqlitePackLayout, crate::SqliteAcquisitionSchema);
 /// The change log script for `layout`: its tables and every logging trigger.
@@ -34,6 +36,7 @@ fn scripts((layout, acquisition): Selection) -> Vec<String> {
         crate::SqlitePackLayout::Monolithic => OBJECTS.to_owned(),
         crate::SqlitePackLayout::GroupRows => UNITS.to_owned(),
         crate::SqlitePackLayout::GroupRowsIndexed => format!("{UNITS}{UNIT_INDEX}"),
+        crate::SqlitePackLayout::ExternalContent => EXTERNAL.to_owned(),
     };
     let stored = layout.version() + acquisition.version_offset();
     let version = format!("schema_version={stored}");

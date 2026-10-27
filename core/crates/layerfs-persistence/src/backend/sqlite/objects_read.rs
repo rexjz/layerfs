@@ -52,6 +52,11 @@ pub(crate) fn read(
             out.push(super::units_read::whole(tx, info)?);
             continue;
         }
+        if tx.layout().uses_external_content() {
+            let body = super::content::body(tx, &info)?;
+            out.push(PersistedPack::authenticate(info, body)?);
+            continue;
+        }
         let mut rows = tx.query(
             "SELECT body FROM pack WHERE pack_id=?1",
             vec![Param::I64(info.pack_id)],

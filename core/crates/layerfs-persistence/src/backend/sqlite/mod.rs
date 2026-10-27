@@ -2,6 +2,7 @@
 pub(crate) mod acquisition;
 mod admission;
 pub(crate) mod connection;
+pub(crate) mod content;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod file_control;

@@ -25,6 +25,11 @@ impl Session {
         let identity = super::seal_allocation::Identity::capture(&self.path)?;
         #[cfg(target_os = "macos")]
         super::file_control::disable_persistent_wal(&state.connection)?;
+        // ExternalContent: the sole owner drops the unreferenced tail and syncs.
+        let content_bytes = match &self.content {
+            Some(file) => Some(super::content::trim(&state.connection, &state.work, file)?),
+            None => None,
+        };
         let result = query::run(
             &state.connection,
             "PRAGMA wal_checkpoint(TRUNCATE)",
@@ -74,6 +79,7 @@ impl Session {
             profile: self.profile.persistence,
             sqlite_version: self.profile.sqlite_version,
             bytes,
+            content_bytes,
         })
     }
 }

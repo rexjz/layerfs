@@ -28,26 +28,39 @@ pub enum SqlitePackLayout {
     GroupRows,
     /// Schema3 group rows with a covering index for bounded mapping validation.
     GroupRowsIndexed,
+    /// Schema19 pack metadata rows; every body is appended, in publication
+    /// order, to one sibling file `<store>-content` at its row's `offset`.
+    ExternalContent,
 }
 impl SqlitePackLayout {
     pub(crate) const fn uses_units(self) -> bool {
         matches!(self, Self::GroupRows | Self::GroupRowsIndexed)
+    }
+    pub(crate) const fn uses_external_content(self) -> bool {
+        matches!(self, Self::ExternalContent)
     }
     pub(crate) const fn version(self) -> i64 {
         match self {
             Self::Monolithic => 16,
             Self::GroupRows => 17,
             Self::GroupRowsIndexed => 18,
+            Self::ExternalContent => 19,
         }
     }
+}
+/// Path of the append-only content file of an `ExternalContent` Store.
+pub fn content_path(store: &std::path::Path) -> PathBuf {
+    let mut path = store.as_os_str().to_os_string();
+    path.push("-content");
+    PathBuf::from(path)
 }
 /// Explicit creation-only selection of the initial-acquisition working tables.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SqliteAcquisitionSchema {
-    /// Schema versions 16 to 18: no acquisition tables; acquisition is unavailable.
+    /// Schema versions 16 to 19: no acquisition tables; acquisition is unavailable.
     #[default]
     Absent,
-    /// Schema versions 22 to 24: the same pack layouts with the acquisition tables.
+    /// Schema versions 22 to 25: the same pack layouts with the acquisition tables.
     Tables,
 }
 impl SqliteAcquisitionSchema {

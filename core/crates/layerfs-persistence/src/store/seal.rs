@@ -14,6 +14,9 @@ pub struct SealedStore {
     pub sqlite_version: String,
     /// Main-file bytes after the WAL was checkpointed and the connection closed.
     pub bytes: u64,
+    /// `ExternalContent` only: bytes of `<path>-content`, trimmed to the last
+    /// committed pack and synced before the checkpoint.
+    pub content_bytes: Option<u64>,
 }
 
 impl Handles {

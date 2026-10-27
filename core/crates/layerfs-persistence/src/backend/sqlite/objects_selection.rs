@@ -40,6 +40,14 @@ fn read_with<T>(
     if id <= 0 {
         return Err(PersistenceError::Malformed);
     }
+    if tx.layout().uses_external_content() {
+        let (descriptor, base) = super::content::locate(tx, id)?;
+        let file = tx.content()?;
+        let length = descriptor.length;
+        return acquire(descriptor, &mut |offset, bytes| {
+            super::content::read_at(tx, file, base, length, offset, bytes)
+        });
+    }
     let descriptors = tx.query(
         "SELECT pack_id,domain,digest,length FROM pack WHERE pack_id=?1",
         vec![Param::I64(id)],

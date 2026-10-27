@@ -21,7 +21,7 @@ use layerfs_api::{
 use layerfs_bridge::control::{SdkRefusal, SdkValue};
 use layerfs_bridge::sdk_values::hex;
 use layerfs_history::{BranchId, HistoryCatalogConfig, HistoryName, LayerStackId};
-use layerfs_persistence::{PersistenceConfig, SqlitePersistenceProfile};
+use layerfs_persistence::{PersistenceConfig, SqlitePackLayout, SqlitePersistenceProfile};
 use layerfs_storage::StoragePolicy;
 use layerfs_telemetry::timer::Timing;
 use std::path::{Path, PathBuf};
@@ -75,7 +75,8 @@ pub(crate) fn init(args: &SdkValue) -> Outcome {
     let request = InitRequest {
         source,
         store: PersistenceConfig::sqlite(directory.join("sealed.sqlite"))
-            .with_sqlite_profile(SqlitePersistenceProfile::Disposable),
+            .with_sqlite_profile(SqlitePersistenceProfile::Disposable)
+            .with_sqlite_pack_layout(pack_layout()?),
         locator: LOCATOR.into(),
         policy,
         catalog: HistoryCatalogConfig {
@@ -132,12 +133,24 @@ pub(crate) fn init(args: &SdkValue) -> Outcome {
     ))
 }
 
+/// The pack layout of a new project's Store: `LAYERFS_PACK_LAYOUT=external`
+/// keeps pack bodies in `<store>-content`; unset keeps the default layout.
+fn pack_layout() -> Result<SqlitePackLayout, SdkRefusal> {
+    match std::env::var("LAYERFS_PACK_LAYOUT").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("") => Ok(SqlitePackLayout::default()),
+        Ok("external") => Ok(SqlitePackLayout::ExternalContent),
+        _ => Err(refused(
+            "InvalidInput",
+            "LAYERFS_PACK_LAYOUT must be unset or external",
+        )),
+    }
+}
 /// Deletes the sealed Store after its install is recorded, once: the file
 /// and any SQLite side file. A delete that fails is `{ path, message }` for
 /// the answer; the project stays usable.
 fn remove_sealed(sealed: &Path) -> Option<SdkValue> {
     let mut failures = Vec::new();
-    for suffix in ["", "-wal", "-shm", "-journal"] {
+    for suffix in ["", "-wal", "-shm", "-journal", "-content"] {
         let mut path = sealed.as_os_str().to_owned();
         path.push(suffix);
         let path = PathBuf::from(path);

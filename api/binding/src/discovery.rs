@@ -323,6 +323,11 @@ pub(crate) fn project(args: &SdkValue) -> Result<Project> {
             profile: SqlitePersistenceProfile::Disposable,
             sqlite_version: manifest.host_sqlite.clone(),
             bytes: manifest.bytes,
+            content_bytes: std::fs::metadata(layerfs_persistence::content_path(
+                &path.join("sealed.sqlite"),
+            ))
+            .ok()
+            .map(|m| m.len()),
         },
         manifest,
         installed,

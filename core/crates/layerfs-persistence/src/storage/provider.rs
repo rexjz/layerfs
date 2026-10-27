@@ -89,7 +89,9 @@ impl PackPersistence for StorageProvider {
         pack: &PublishedPack,
     ) -> Result<(usize, u64), PersistenceError> {
         match self.session.layout {
-            crate::SqlitePackLayout::Monolithic => Ok((1, pack.body.len() as u64)),
+            crate::SqlitePackLayout::Monolithic | crate::SqlitePackLayout::ExternalContent => {
+                Ok((1, pack.body.len() as u64))
+            }
             crate::SqlitePackLayout::GroupRows | crate::SqlitePackLayout::GroupRowsIndexed => {
                 crate::backend::sqlite::unit_layout::cost(pack)
             }
