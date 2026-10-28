@@ -8,6 +8,7 @@ mod store;
 pub(crate) use store::config;
 pub(crate) use store::handles;
 mod history;
+pub mod replication;
 #[cfg(feature = "postgresql")]
 pub use backend::postgresql::status::{
     status as postgresql_status, PostgresStatus, PostgresStatusError,
